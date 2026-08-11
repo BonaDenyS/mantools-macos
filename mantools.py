@@ -15,6 +15,8 @@ GUI (light/dark theme, tabbed):
                   merging.
     Convert tab - PDF <-> Word / PowerPoint / Excel, one file or a batch.
     Extract tab - pull pages into a new PDF, or extract text or images.
+    Watermark tab - stamp a text or image/logo watermark (centered or tiled)
+                  onto a PDF or an image file, with a live preview.
 
 Command line - merge:
     python3 mantools.py -o merged.pdf a.pdf b.pdf
@@ -30,6 +32,11 @@ Command line - extract:
     python3 mantools.py extract report.pdf --pages 1-3,7 --what pages
     python3 mantools.py extract report.pdf --what text -o notes.txt
     python3 mantools.py extract report.pdf --what images -o out_folder
+
+Command line - watermark (PDF or image):
+    python3 mantools.py watermark report.pdf --text CONFIDENTIAL
+    python3 mantools.py watermark photo.jpg --text DRAFT --color Red --opacity 20
+    python3 mantools.py watermark photo.png --image logo.png --tiled --density 6
 
 Page syntax: 1-3,7 (pages 1,2,3,7)  |  4- (page 4 to end)  |  -2 (start to 2)
              5-1 (pages 5,4,3,2,1 - reverses that span)
@@ -991,6 +998,250 @@ def extract_images(src: str, out_dir: str, pages: str = "all",
 
 
 # --------------------------------------------------------------------------
+# Watermark engine (stamp text across PDF pages)
+# --------------------------------------------------------------------------
+
+class WatermarkError(Exception):
+    """Raised with a message that is safe to show the user directly."""
+
+
+WATERMARK_COLORS = {
+    "Gray":  (0.50, 0.50, 0.50),
+    "Red":   (0.80, 0.16, 0.16),
+    "Blue":  (0.16, 0.35, 0.82),
+    "Green": (0.13, 0.53, 0.27),
+    "Black": (0.00, 0.00, 0.00),
+}
+
+
+def add_watermark(src: str, out: str, text: str = "", pages: str = "all",
+                  font_size: float = 48, color=(0.5, 0.5, 0.5),
+                  opacity: float = 0.15, angle: float = 45,
+                  tiled: bool = False, image: str = "", image_width: float = 220,
+                  density: int = 4, password: str = "", progress=None) -> int:
+    """Stamp a text or image watermark across the chosen pages.
+
+    Pass `image` (a PNG/JPG path) for a logo watermark; otherwise `text` is
+    stamped. `density` sets how many copies fit across the page when `tiled`.
+    Returns the number of pages stamped.
+    """
+    _require(HAS_FITZ, "Watermarking needs PyMuPDF.\n    pip install pymupdf")
+    use_image = bool(image)
+    if use_image:
+        if not os.path.isfile(image):
+            raise WatermarkError(
+                f"Watermark image {os.path.basename(image)} could not be found.")
+        try:
+            png_bytes, (img_w, img_h) = _prepare_wm_image(image, opacity, angle)
+        except Exception as exc:
+            raise WatermarkError(f"Could not read the watermark image: {exc}")
+    elif not (text or "").strip():
+        raise WatermarkError("Enter some watermark text.")
+    if not os.path.isfile(src):
+        raise WatermarkError(f"{os.path.basename(src)} could not be found.")
+    try:
+        document = _fitz.open(src)
+    except Exception as exc:
+        raise WatermarkError(f"{os.path.basename(src)} is not a readable PDF: {exc}")
+    if document.needs_pass:
+        document.authenticate(password or "")
+    total = document.page_count
+    try:
+        wanted = set(_resolve_indices(pages, total))
+    except ExtractError as exc:
+        document.close()
+        raise WatermarkError(str(exc))
+
+    done = 0
+    for index in range(total):
+        if index not in wanted:
+            continue
+        if use_image:
+            _stamp_image_page(document[index], png_bytes, img_w, img_h,
+                              float(image_width), tiled, density)
+        else:
+            _stamp_page(document[index], text, float(font_size), color,
+                        float(opacity), float(angle), tiled, density)
+        done += 1
+        if progress:
+            progress(done, len(wanted), f"Page {index + 1}")
+
+    directory = os.path.dirname(os.path.abspath(out)) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(suffix=".pdf", dir=directory)
+    os.close(fd)
+    try:
+        document.save(tmp, garbage=3, deflate=True)
+    finally:
+        document.close()
+    try:
+        os.replace(tmp, out)
+    except OSError as exc:
+        _quiet_remove(tmp)
+        raise WatermarkError(f"Could not save to {out}: {exc}")
+    return done
+
+
+def _prepare_wm_image(path: str, opacity: float, angle: float):
+    """Load a watermark image, bake in opacity + rotation. Returns (png, size)."""
+    from PIL import Image
+    import io
+    image = Image.open(path).convert("RGBA")
+    if opacity < 1:
+        alpha = image.getchannel("A").point(lambda v: int(v * opacity))
+        image.putalpha(alpha)
+    turn = float(angle) % 360
+    if turn:
+        image = image.rotate(turn, expand=True, resample=Image.BICUBIC)
+    buffer = io.BytesIO()
+    image.save(buffer, "PNG")
+    return buffer.getvalue(), image.size
+
+
+def _stamp_image_page(page, png_bytes, img_w, img_h, target_w, tiled,
+                      density=4) -> None:
+    rect = page.rect
+    aspect = (img_h / img_w) if img_w else 1.0
+    box_w = target_w
+    box_h = target_w * aspect
+    if tiled:
+        cols = max(1, int(round(density)))
+        gap = rect.width / cols
+        y = gap * 0.5
+        while y < rect.height + gap * 0.5:
+            x = gap * 0.5
+            while x < rect.width + gap * 0.5:
+                page.insert_image(_fitz.Rect(x - box_w / 2, y - box_h / 2,
+                                             x + box_w / 2, y + box_h / 2),
+                                  stream=png_bytes, keep_proportion=True,
+                                  overlay=True)
+                x += gap
+            y += gap
+    else:
+        cx, cy = rect.width / 2, rect.height / 2
+        page.insert_image(_fitz.Rect(cx - box_w / 2, cy - box_h / 2,
+                                     cx + box_w / 2, cy + box_h / 2),
+                          stream=png_bytes, keep_proportion=True, overlay=True)
+
+
+def _stamp_page(page, text, font_size, color, opacity, angle, tiled,
+                density=4) -> None:
+    rect = page.rect
+    fontname = "helv"
+    matrix = _fitz.Matrix(1, 1).prerotate(angle)
+    text_w = _fitz.get_text_length(text, fontname=fontname, fontsize=font_size)
+    kw = dict(fontname=fontname, fontsize=font_size, color=color,
+              fill_opacity=opacity, overlay=True)
+    if tiled:
+        cols = max(1, int(round(density)))
+        gap = rect.width / cols
+        y = gap * 0.5
+        while y < rect.height + gap * 0.5:
+            x = gap * 0.5
+            while x < rect.width + gap * 0.5:
+                point = _fitz.Point(x - text_w / 2, y + font_size * 0.30)
+                page.insert_text(point, text, morph=(_fitz.Point(x, y), matrix),
+                                 **kw)
+                x += gap
+            y += gap
+    else:
+        cx, cy = rect.width / 2, rect.height / 2
+        point = _fitz.Point(cx - text_w / 2, cy + font_size * 0.35)
+        page.insert_text(point, text, morph=(_fitz.Point(cx, cy), matrix), **kw)
+
+
+WATERMARK_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif",
+                        ".tiff", ".webp")
+
+
+def is_watermark_image(path: str) -> bool:
+    """True if `path` looks like an image file (vs. a PDF) to watermark."""
+    return os.path.splitext(path)[1].lower() in WATERMARK_IMAGE_EXTS
+
+
+def _image_to_page(src: str, ref_width: float = 612.0):
+    """Wrap an image in a one-page PDF sized to a reference width.
+
+    Watermark sizes then behave the same as on a PDF page regardless of the
+    image's pixel dimensions. Returns (doc, page, scale) where rendering the
+    page at `scale` restores the original resolution.
+    """
+    try:
+        pix = _fitz.Pixmap(src)
+    except Exception as exc:
+        raise WatermarkError(
+            f"{os.path.basename(src)} is not a readable image: {exc}")
+    img_w, img_h = pix.width, pix.height
+    if not img_w or not img_h:
+        raise WatermarkError(f"{os.path.basename(src)} has no pixels.")
+    scale = img_w / ref_width
+    page_w, page_h = ref_width, img_h / scale
+    doc = _fitz.open()
+    page = doc.new_page(width=page_w, height=page_h)
+    page.insert_image(_fitz.Rect(0, 0, page_w, page_h), pixmap=pix)
+    return doc, page, scale
+
+
+def watermark_image(src: str, out: str, text: str = "", pages: str = "all",
+                    font_size: float = 48, color=(0.5, 0.5, 0.5),
+                    opacity: float = 0.15, angle: float = 45,
+                    tiled: bool = False, image: str = "",
+                    image_width: float = 220, density: int = 4,
+                    password: str = "", progress=None) -> int:
+    """Stamp a text or image watermark onto an image file. Returns 1.
+
+    `pages`/`password` are accepted (for a common signature with
+    `add_watermark`) but ignored - an image is a single frame.
+    """
+    _require(HAS_FITZ, "Watermarking needs PyMuPDF.\n    pip install pymupdf")
+    use_image = bool(image)
+    if use_image:
+        if not os.path.isfile(image):
+            raise WatermarkError(
+                f"Watermark image {os.path.basename(image)} could not be found.")
+    elif not (text or "").strip():
+        raise WatermarkError("Enter some watermark text.")
+    if not os.path.isfile(src):
+        raise WatermarkError(f"{os.path.basename(src)} could not be found.")
+
+    doc, page, scale = _image_to_page(src)
+    try:
+        if use_image:
+            png_bytes, (img_w, img_h) = _prepare_wm_image(image, opacity, angle)
+            _stamp_image_page(page, png_bytes, img_w, img_h, float(image_width),
+                              tiled, density)
+        else:
+            _stamp_page(page, text, float(font_size), color, float(opacity),
+                        float(angle), tiled, density)
+        result = page.get_pixmap(matrix=_fitz.Matrix(scale, scale), alpha=False)
+    finally:
+        doc.close()
+
+    directory = os.path.dirname(os.path.abspath(out)) or "."
+    os.makedirs(directory, exist_ok=True)
+    from PIL import Image
+    pil = Image.frombytes("RGB", (result.width, result.height), result.samples)
+    ext = os.path.splitext(out)[1].lower()
+    try:
+        if ext in (".jpg", ".jpeg"):
+            pil.save(out, quality=92)
+        else:
+            pil.save(out)
+    except Exception as exc:
+        raise WatermarkError(f"Could not save to {out}: {exc}")
+    if progress:
+        progress(1, 1, os.path.basename(src))
+    return 1
+
+
+def apply_watermark(src: str, out: str, **kwargs) -> int:
+    """Watermark a PDF or an image, chosen by the source file type."""
+    if is_watermark_image(src):
+        return watermark_image(src, out, **kwargs)
+    return add_watermark(src, out, **kwargs)
+
+
+# --------------------------------------------------------------------------
 # Command line
 # --------------------------------------------------------------------------
 
@@ -1240,6 +1491,83 @@ def run_extract_cli(argv: list[str]) -> int:
     return 0
 
 
+def run_watermark_cli(argv: list[str]) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="mantools.py watermark",
+        description=f"{APP_NAME} - stamp a text or image watermark onto a PDF "
+                    "or an image file.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Examples:\n"
+               "  mantools.py watermark report.pdf --text CONFIDENTIAL\n"
+               "  mantools.py watermark photo.jpg --text DRAFT --color Red "
+               "--opacity 20\n"
+               "  mantools.py watermark photo.png --image logo.png --tiled",
+    )
+    parser.add_argument("input", metavar="FILE", help="a PDF or an image file")
+    parser.add_argument("--text", default="", help="the watermark text")
+    parser.add_argument("--image", default="", metavar="PNG",
+                        help="stamp this image/logo instead of text")
+    parser.add_argument("--pages", default="all", metavar="RANGE",
+                        help="pages to stamp, e.g. 1-3,7 or all (default: all)")
+    parser.add_argument("--size", type=float, default=48,
+                        help="font size (text) — for images use --image-width")
+    parser.add_argument("--image-width", type=float, default=220,
+                        help="image watermark width in points (default: 220)")
+    parser.add_argument("--color", default="Gray", choices=list(WATERMARK_COLORS),
+                        help="text colour (default: Gray)")
+    parser.add_argument("--opacity", type=float, default=15,
+                        help="opacity percent, 1-100 (default: 15)")
+    parser.add_argument("--angle", type=float, default=45,
+                        help="rotation in degrees (default: 45)")
+    parser.add_argument("--tiled", action="store_true",
+                        help="repeat the watermark across the whole page")
+    parser.add_argument("--density", type=int, default=4,
+                        help="tiled: how many copies across the page (default: 4)")
+    parser.add_argument("-o", "--output", metavar="PATH")
+    parser.add_argument("--password", default="")
+    parser.add_argument("--quiet", action="store_true")
+    args = parser.parse_args(argv)
+
+    if not args.text and not args.image:
+        print("Error: pass --text or --image.", file=sys.stderr)
+        return 2
+
+    src = args.input
+    stem = os.path.splitext(os.path.basename(src))[0]
+    src_ext = os.path.splitext(src)[1] or ".pdf"
+    out = args.output or os.path.join(
+        os.path.dirname(os.path.abspath(src)), f"{stem}_watermarked{src_ext}")
+
+    def show(done, total, name):
+        if not args.quiet:
+            sys.stdout.write(f"\r  {name} {done}/{total}   ")
+            sys.stdout.flush()
+
+    try:
+        stamped = apply_watermark(
+            src, out, text=args.text, pages=args.pages, font_size=args.size,
+            color=WATERMARK_COLORS[args.color],
+            opacity=max(0.0, min(1.0, args.opacity / 100.0)),
+            angle=args.angle, tiled=args.tiled, image=args.image,
+            image_width=args.image_width, density=max(1, args.density),
+            password=args.password, progress=show)
+    except (WatermarkError, MergeError) as exc:
+        if not args.quiet:
+            sys.stdout.write("\r")
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if not args.quiet:
+        if is_watermark_image(src):
+            print(f"\rWatermarked {os.path.basename(src)} -> {out}".ljust(70))
+        else:
+            print(f"\rWatermarked {stamped} page{'s' if stamped != 1 else ''} -> "
+                  f"{out}".ljust(70))
+    return 0
+
+
 # --------------------------------------------------------------------------
 # Window version  ("Mantools" - light/dark themed desktop UI)
 # --------------------------------------------------------------------------
@@ -1281,7 +1609,8 @@ def run_gui(_smoke=None) -> int:
     """
     try:
         import tkinter as tk
-        from tkinter import ttk, filedialog, messagebox, simpledialog, font as tkfont
+        from tkinter import (ttk, filedialog, messagebox, simpledialog,
+                             colorchooser, font as tkfont)
     except ImportError:
         print(
             "The window version needs tkinter, which is missing from this "
@@ -1572,6 +1901,10 @@ def run_gui(_smoke=None) -> int:
             self.ex_working = False
             self._ex_drain_id = None
 
+            self.wm_events: queue.Queue = queue.Queue()
+            self.wm_working = False
+            self._wm_drain_id = None
+
             self.tab = "merge"
             self.routes = conversion_routes()
 
@@ -1586,6 +1919,7 @@ def run_gui(_smoke=None) -> int:
             self._drain_id = self.after(100, self._drain_events)
             self._conv_drain_id = self.after(100, self._drain_conv_events)
             self._ex_drain_id = self.after(100, self._drain_ex_events)
+            self._wm_drain_id = self.after(100, self._drain_wm_events)
 
             if PYPDF_ERROR:
                 self.after(200, self._warn_missing_pypdf)
@@ -1719,6 +2053,9 @@ def run_gui(_smoke=None) -> int:
                         arrowcolor=C["ink"], bordercolor=C["field_bd"], padding=5)
             s.configure("TEntry", fieldbackground=C["field"], foreground=C["ink"],
                         bordercolor=C["field_bd"], insertcolor=C["ink"], padding=6)
+            s.configure("TSpinbox", fieldbackground=C["field"],
+                        foreground=C["ink"], background=C["field"],
+                        arrowcolor=C["ink"], bordercolor=C["field_bd"], padding=4)
 
         def _apply_theme(self):
             self.C = dict(THEMES[self.theme])
@@ -1761,7 +2098,7 @@ def run_gui(_smoke=None) -> int:
             tabbar.pack(fill="x", pady=(16, 0))
             self._tabs = {}
             for key, text in (("merge", "Merge"), ("convert", "Convert"),
-                              ("extract", "Extract")):
+                              ("extract", "Extract"), ("watermark", "Watermark")):
                 holder = ttk.Frame(tabbar, style="App.TFrame")
                 holder.pack(side="left", padx=(0, 26))
                 label = ttk.Label(holder, text=text, style="Tab.TLabel",
@@ -1800,8 +2137,10 @@ def run_gui(_smoke=None) -> int:
                 self._build_merge(self.content)
             elif key == "convert":
                 self._build_convert(self.content)
-            else:
+            elif key == "extract":
                 self._build_extract(self.content)
+            else:
+                self._build_watermark(self.content)
 
         def _bind_keys(self):
             self.bind("<Control-o>", lambda _e: self._route_add())
@@ -2667,9 +3006,519 @@ def run_gui(_smoke=None) -> int:
                 pass
             self._ex_drain_id = self.after(100, self._drain_ex_events)
 
+        # ==============================================================
+        # WATERMARK TAB
+        # ==============================================================
+        def _build_watermark(self, parent):
+            C = self.C
+            top = ttk.Frame(parent, style="App.TFrame")
+            top.pack(fill="x")
+            top.columnconfigure(0, weight=1)
+
+            form = ttk.Frame(top, style="Card.TFrame", padding=16)
+            form.grid(row=0, column=0, sticky="nsew")
+            form.columnconfigure(1, weight=1)
+
+            ttk.Label(form, text="Source:", style="CardInk.TLabel").grid(
+                row=0, column=0, sticky="w", pady=(0, 10))
+            self.wm_src = tk.StringVar(value=getattr(self, "_wm_src_saved", ""))
+            ttk.Entry(form, textvariable=self.wm_src).grid(
+                row=0, column=1, sticky="ew", padx=(10, 8), pady=(0, 10))
+            ttk.Button(form, text="Browse…", style="Ghost.TButton",
+                       command=self._wm_pick_source).grid(row=0, column=2,
+                                                          pady=(0, 10))
+
+            ttk.Label(form, text="Type:", style="CardInk.TLabel").grid(
+                row=1, column=0, sticky="w", pady=(0, 10))
+            typ = ttk.Frame(form, style="Card.TFrame")
+            typ.grid(row=1, column=1, columnspan=2, sticky="w", padx=(10, 0),
+                     pady=(0, 10))
+            self.wm_type = getattr(self, "wm_type", "text")
+            self._wm_typeseg = {}
+            for key, label in (("text", "Text"), ("image", "Image / logo")):
+                btn = ttk.Button(typ, text=label,
+                                 style="SegOn.TButton" if self.wm_type == key
+                                 else "Seg.TButton",
+                                 command=lambda k=key: self._wm_set_type(k))
+                btn.pack(side="left", padx=(0, 8))
+                self._wm_typeseg[key] = btn
+
+            # text row and image row share grid row 2 (only one shown at a time)
+            self._wm_text_row = ttk.Frame(form, style="Card.TFrame")
+            self._wm_text_row.grid(row=2, column=0, columnspan=3, sticky="ew",
+                                   pady=(0, 10))
+            self._wm_text_row.columnconfigure(1, weight=1)
+            ttk.Label(self._wm_text_row, text="Watermark text:",
+                      style="CardInk.TLabel").grid(row=0, column=0, sticky="w")
+            self.wm_text = tk.StringVar(
+                value=getattr(self, "_wm_text_saved", "CONFIDENTIAL"))
+            te = ttk.Entry(self._wm_text_row, textvariable=self.wm_text)
+            te.grid(row=0, column=1, sticky="ew", padx=(10, 0))
+            te.bind("<KeyRelease>", lambda _e: self._wm_schedule_preview())
+
+            self._wm_image_row = ttk.Frame(form, style="Card.TFrame")
+            self._wm_image_row.grid(row=2, column=0, columnspan=3, sticky="ew",
+                                    pady=(0, 10))
+            self._wm_image_row.columnconfigure(1, weight=1)
+            ttk.Label(self._wm_image_row, text="Image / logo:",
+                      style="CardInk.TLabel").grid(row=0, column=0, sticky="w")
+            self.wm_image = tk.StringVar(value=getattr(self, "_wm_image_saved", ""))
+            ttk.Entry(self._wm_image_row, textvariable=self.wm_image).grid(
+                row=0, column=1, sticky="ew", padx=(10, 8))
+            ttk.Button(self._wm_image_row, text="Browse…", style="Ghost.TButton",
+                       command=self._wm_pick_image).grid(row=0, column=2)
+
+            self._wm_color_row = ttk.Frame(form, style="Card.TFrame")
+            self._wm_color_row.grid(row=3, column=0, columnspan=3, sticky="w",
+                                    pady=(0, 10))
+            ttk.Label(self._wm_color_row, text="Colour:",
+                      style="CardInk.TLabel").pack(side="left")
+            self.wm_color = tk.StringVar(value=getattr(self, "_wm_color_saved",
+                                                       "Gray"))
+            cbox = ttk.Combobox(self._wm_color_row, textvariable=self.wm_color,
+                                state="readonly", width=8,
+                                values=list(WATERMARK_COLORS) + ["Custom"])
+            cbox.pack(side="left", padx=(10, 8))
+            cbox.bind("<<ComboboxSelected>>", lambda _e: self._wm_color_changed())
+            self.wm_swatch = tk.Frame(self._wm_color_row, width=22, height=22,
+                                      highlightthickness=1,
+                                      highlightbackground=C["border"])
+            self.wm_swatch.pack(side="left")
+            self.wm_swatch.pack_propagate(False)
+            ttk.Button(self._wm_color_row, text="Custom…", style="Ghost.TButton",
+                       command=self._wm_pick_color).pack(side="left", padx=(8, 0))
+
+            ttk.Label(form, text="Style:", style="CardInk.TLabel").grid(
+                row=4, column=0, sticky="w", pady=(0, 10))
+            strow = ttk.Frame(form, style="Card.TFrame")
+            strow.grid(row=4, column=1, columnspan=2, sticky="w", padx=(10, 0),
+                       pady=(0, 10))
+            self.wm_opacity = tk.StringVar(value=getattr(self, "_wm_opacity_saved",
+                                                         "15%"))
+            ttk.Label(strow, text="Opacity", style="CardMuted.TLabel").pack(
+                side="left")
+            ocb = ttk.Combobox(strow, textvariable=self.wm_opacity,
+                               state="readonly", width=6,
+                               values=["10%", "15%", "20%", "30%", "50%", "70%",
+                                       "100%"])
+            ocb.pack(side="left", padx=(6, 16))
+            ocb.bind("<<ComboboxSelected>>", lambda _e: self._wm_schedule_preview())
+            self.wm_rot = tk.StringVar(value=getattr(self, "_wm_rot_saved", "45°"))
+            ttk.Label(strow, text="Angle", style="CardMuted.TLabel").pack(
+                side="left")
+            acb = ttk.Combobox(strow, textvariable=self.wm_rot, state="readonly",
+                               width=6, values=["45°", "30°", "0°", "90°", "-45°"])
+            acb.pack(side="left", padx=(6, 16))
+            acb.bind("<<ComboboxSelected>>", lambda _e: self._wm_schedule_preview())
+            self.wm_size = tk.StringVar(value=getattr(self, "_wm_size_saved", "48"))
+            self._wm_size_lbl = ttk.Label(strow, text="Size",
+                                          style="CardMuted.TLabel")
+            self._wm_size_lbl.pack(side="left")
+            sze = ttk.Entry(strow, textvariable=self.wm_size, width=6)
+            sze.pack(side="left", padx=(6, 0))
+            sze.bind("<KeyRelease>", lambda _e: self._wm_schedule_preview())
+
+            ttk.Label(form, text="Layout:", style="CardInk.TLabel").grid(
+                row=5, column=0, sticky="w")
+            lay = ttk.Frame(form, style="Card.TFrame")
+            lay.grid(row=5, column=1, columnspan=2, sticky="w", padx=(10, 0))
+            self.wm_layout = getattr(self, "wm_layout", "centered")
+            self._wm_seg = {}
+            for key, label in (("centered", "Centered"), ("tiled", "Tiled")):
+                btn = ttk.Button(lay, text=label,
+                                 style="SegOn.TButton" if self.wm_layout == key
+                                 else "Seg.TButton",
+                                 command=lambda k=key: self._wm_set_layout(k))
+                btn.pack(side="left", padx=(0, 8))
+                self._wm_seg[key] = btn
+            ttk.Label(lay, text="    Pages:", style="CardMuted.TLabel").pack(
+                side="left", padx=(10, 0))
+            self.wm_pages = tk.StringVar(value=getattr(self, "_wm_pages_saved",
+                                                       "all"))
+            pen = ttk.Entry(lay, textvariable=self.wm_pages, width=12)
+            pen.pack(side="left", padx=(6, 0))
+            pen.bind("<KeyRelease>", lambda _e: self._wm_schedule_preview())
+            self._wm_pages_entry = pen
+
+            # tiled-only: how many copies across the page
+            self._wm_density_lbl = ttk.Label(lay, text="    Tiles across:",
+                                             style="CardMuted.TLabel")
+            self.wm_density = tk.StringVar(value=getattr(self, "_wm_density_saved",
+                                                         "4"))
+            self._wm_density_spin = ttk.Spinbox(
+                lay, from_=1, to=16, width=4, textvariable=self.wm_density,
+                command=self._wm_schedule_preview)
+            self._wm_density_spin.bind("<KeyRelease>",
+                                       lambda _e: self._wm_schedule_preview())
+
+            # live preview (right column)
+            prev = ttk.Frame(top, style="Card.TFrame", padding=12)
+            prev.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
+            ttk.Label(prev, text="Live preview", style="CardInk.TLabel").pack(
+                anchor="w")
+            self.wm_preview_holder = tk.Frame(prev, bg=C["page"], width=300,
+                                              height=400, highlightthickness=1,
+                                              highlightbackground=C["border"])
+            self.wm_preview_holder.pack(pady=(8, 0))
+            self.wm_preview_holder.pack_propagate(False)
+            self.wm_preview_label = tk.Label(self.wm_preview_holder, bg=C["page"],
+                                             fg=C["muted"], font=(UI, 9),
+                                             text="Select a PDF to preview")
+            self.wm_preview_label.pack(fill="both", expand=True)
+            self.wm_preview_cap = tk.StringVar(value="")
+            ttk.Label(prev, textvariable=self.wm_preview_cap,
+                      style="CardMuted.TLabel").pack(anchor="w", pady=(6, 0))
+
+            dest = ttk.Frame(parent, style="Card.TFrame", padding=12)
+            dest.pack(fill="x", pady=(12, 0))
+            ttk.Label(dest, text="Save to:", style="CardInk.TLabel").pack(side="left")
+            self.wm_out = tk.StringVar(value=getattr(self, "_wm_out_saved", ""))
+            ttk.Entry(dest, textvariable=self.wm_out).pack(
+                side="left", fill="x", expand=True, padx=(10, 8))
+            ttk.Button(dest, text="Browse…", style="Ghost.TButton",
+                       command=self._wm_pick_folder).pack(side="left")
+            self.wm_button = ttk.Button(dest, text="Apply Watermark",
+                                        style="Primary.TButton",
+                                        command=self.start_watermark)
+            self.wm_button.pack(side="left", padx=(10, 0))
+
+            ttk.Label(parent, text="Source can be a PDF or an image. Leave "
+                      "'Save to' blank to write the result next to the source.",
+                      style="Muted.TLabel").pack(anchor="w", pady=(6, 0))
+            self.wm_progress = ttk.Progressbar(
+                parent, mode="determinate",
+                style="Accent.Horizontal.TProgressbar")
+            self.wm_status = tk.StringVar(value="Choose a PDF or image to "
+                                          "watermark.")
+            ttk.Label(parent, textvariable=self.wm_status, style="Status.TLabel"
+                      ).pack(anchor="w", pady=(10, 0))
+
+            self._wm_custom = getattr(self, "_wm_custom", None)
+            self._wm_preview_after = None
+            self._wm_apply_type_visibility()
+            self._wm_update_swatch()
+            self._wm_update_source_kind()
+            self._wm_update_density_vis()
+            self._wm_schedule_preview()
+
+        def _wm_update_density_vis(self):
+            if self.wm_layout == "tiled":
+                self._wm_density_lbl.pack(side="left", padx=(10, 0))
+                self._wm_density_spin.pack(side="left", padx=(6, 0))
+            else:
+                self._wm_density_lbl.pack_forget()
+                self._wm_density_spin.pack_forget()
+
+        def _wm_update_source_kind(self):
+            src = self.wm_src.get().strip()
+            is_img = bool(src) and is_watermark_image(src)
+            try:
+                self._wm_pages_entry.configure(
+                    state="disabled" if is_img else "normal")
+            except Exception:
+                pass
+
+        def _wm_apply_type_visibility(self):
+            if self.wm_type == "text":
+                self._wm_image_row.grid_remove()
+                self._wm_text_row.grid()
+                self._wm_color_row.grid()
+                self._wm_size_lbl.configure(text="Size")
+            else:
+                self._wm_text_row.grid_remove()
+                self._wm_image_row.grid()
+                self._wm_color_row.grid_remove()
+                self._wm_size_lbl.configure(text="Width")
+
+        def _wm_set_type(self, key):
+            if key == self.wm_type:
+                return
+            current = self.wm_size.get().strip()
+            if key == "image" and current in ("", "48"):
+                self.wm_size.set("220")
+            if key == "text" and current in ("", "220"):
+                self.wm_size.set("48")
+            self.wm_type = key
+            for name, btn in self._wm_typeseg.items():
+                btn.configure(style="SegOn.TButton" if name == key
+                              else "Seg.TButton")
+            self._wm_apply_type_visibility()
+            self._wm_schedule_preview()
+
+        def _wm_set_layout(self, key):
+            self.wm_layout = key
+            for name, btn in self._wm_seg.items():
+                btn.configure(style="SegOn.TButton" if name == key
+                              else "Seg.TButton")
+            self._wm_update_density_vis()
+            self._wm_schedule_preview()
+
+        def _wm_pick_source(self):
+            images = "*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff *.webp"
+            path = filedialog.askopenfilename(
+                title="Choose a PDF or image",
+                filetypes=[("PDF or image", "*.pdf " + images),
+                           ("PDF files", "*.pdf"), ("Images", images),
+                           ("All files", "*.*")])
+            if path:
+                self.wm_src.set(path)
+                self.wm_status.set(f"Ready: {os.path.basename(path)}")
+                self._wm_update_source_kind()
+                self._wm_schedule_preview()
+
+        def _wm_pick_image(self):
+            path = filedialog.askopenfilename(
+                title="Choose a watermark image",
+                filetypes=[("Images", "*.png *.jpg *.jpeg *.gif *.bmp"),
+                           ("All files", "*.*")])
+            if path:
+                self.wm_image.set(path)
+                self._wm_schedule_preview()
+
+        def _wm_pick_folder(self):
+            folder = filedialog.askdirectory(title="Save watermarked PDF to")
+            if folder:
+                self.wm_out.set(folder)
+
+        def _wm_active_color(self):
+            if self.wm_color.get() == "Custom" and self._wm_custom:
+                return self._wm_custom
+            return WATERMARK_COLORS.get(self.wm_color.get(), (0.5, 0.5, 0.5))
+
+        def _wm_update_swatch(self):
+            r, g, b = self._wm_active_color()
+            self.wm_swatch.configure(
+                bg="#%02x%02x%02x" % (int(r * 255), int(g * 255), int(b * 255)))
+
+        def _wm_color_changed(self):
+            if self.wm_color.get() == "Custom" and not self._wm_custom:
+                self._wm_pick_color()
+            else:
+                self._wm_update_swatch()
+                self._wm_schedule_preview()
+
+        def _wm_pick_color(self):
+            init = self._wm_active_color()
+            init_hex = "#%02x%02x%02x" % (int(init[0] * 255), int(init[1] * 255),
+                                          int(init[2] * 255))
+            rgb, _hex = colorchooser.askcolor(color=init_hex,
+                                              title="Watermark colour", parent=self)
+            if rgb:
+                self._wm_custom = (round(rgb[0]) / 255, round(rgb[1]) / 255,
+                                   round(rgb[2]) / 255)
+                self.wm_color.set("Custom")
+                self._wm_update_swatch()
+                self._wm_schedule_preview()
+
+        def _wm_gather(self):
+            try:
+                size = float(self.wm_size.get().strip() or "48")
+            except ValueError:
+                size = 48.0
+            opacity = int("".join(c for c in self.wm_opacity.get()
+                                  if c.isdigit()) or "15") / 100.0
+            opacity = max(0.0, min(1.0, opacity))
+            try:
+                angle = float(self.wm_rot.get().replace("°", "") or "45")
+            except ValueError:
+                angle = 45.0
+            try:
+                density = max(1, min(20, int(float(self.wm_density.get() or "4"))))
+            except (ValueError, AttributeError):
+                density = 4
+            return dict(size=size, opacity=opacity, angle=angle, density=density,
+                        color=self._wm_active_color(),
+                        tiled=(self.wm_layout == "tiled"), type=self.wm_type,
+                        text=self.wm_text.get(), image=self.wm_image.get().strip(),
+                        pages=self.wm_pages.get().strip() or "all")
+
+        def _wm_schedule_preview(self):
+            if getattr(self, "_wm_preview_after", None):
+                try:
+                    self.after_cancel(self._wm_preview_after)
+                except Exception:
+                    pass
+            self._wm_preview_after = self.after(250, self._wm_render_preview)
+
+        def _wm_render_preview(self):
+            self._wm_preview_after = None
+            if not hasattr(self, "wm_preview_label"):
+                return
+            try:
+                if not self.wm_preview_label.winfo_exists():
+                    return
+            except Exception:
+                return
+            if not HAS_FITZ:
+                self.wm_preview_label.configure(image="", text="Preview needs "
+                                                "PyMuPDF")
+                return
+            src = self.wm_src.get().strip()
+            if not src or not os.path.isfile(src):
+                self.wm_preview_label.configure(
+                    image="", text="Select a PDF or image to preview")
+                self.wm_preview_cap.set("")
+                return
+            settings = self._wm_gather()
+            try:
+                if is_watermark_image(src):
+                    single, page, _scale = _image_to_page(src)
+                    source_label = "Image"
+                else:
+                    document = _fitz.open(src)
+                    total = document.page_count
+                    try:
+                        indices = parse_page_range(settings["pages"], total)
+                    except MergeError:
+                        indices = list(range(total))
+                    page_index = indices[0] if indices else 0
+                    single = _fitz.open()
+                    single.insert_pdf(document, from_page=page_index,
+                                      to_page=page_index)
+                    document.close()
+                    page = single[0]
+                    source_label = f"Page {page_index + 1}"
+                if (settings["type"] == "image" and settings["image"]
+                        and os.path.isfile(settings["image"])):
+                    png, (iw, ih) = _prepare_wm_image(
+                        settings["image"], settings["opacity"], settings["angle"])
+                    _stamp_image_page(page, png, iw, ih, settings["size"],
+                                      settings["tiled"], settings["density"])
+                    kind = "image"
+                elif settings["type"] == "text" and settings["text"].strip():
+                    _stamp_page(page, settings["text"], settings["size"],
+                                settings["color"], settings["opacity"],
+                                settings["angle"], settings["tiled"],
+                                settings["density"])
+                    kind = "text"
+                else:
+                    kind = "none"
+                zoom = min(286 / max(page.rect.width, 1),
+                           384 / max(page.rect.height, 1))
+                pixmap = page.get_pixmap(matrix=_fitz.Matrix(zoom, zoom),
+                                         alpha=False)
+                single.close()
+                photo = tk.PhotoImage(
+                    master=self,
+                    data=base64.b64encode(pixmap.tobytes("png")).decode("ascii"))
+                self._wm_preview_img = photo
+                self.wm_preview_label.configure(image=photo, text="")
+                label = {"image": "image watermark", "text": "text watermark",
+                         "none": "no watermark yet"}[kind]
+                self.wm_preview_cap.set(f"{source_label} · {label}")
+            except Exception:
+                try:
+                    self.wm_preview_label.configure(image="",
+                                                    text="Preview unavailable")
+                except Exception:
+                    pass
+
+        def start_watermark(self):
+            if self.wm_working:
+                return
+            src = self.wm_src.get().strip()
+            if not src or not os.path.isfile(src):
+                messagebox.showinfo("Choose a file",
+                                    "Pick a source PDF or image first.")
+                return
+            settings = self._wm_gather()
+            if settings["type"] == "image":
+                if not settings["image"] or not os.path.isfile(settings["image"]):
+                    messagebox.showinfo("Choose an image",
+                                        "Pick a watermark image (PNG/JPG).")
+                    return
+            elif not settings["text"].strip():
+                messagebox.showinfo("Add text", "Enter the watermark text.")
+                return
+
+            out_dir = self.wm_out.get().strip() or os.path.dirname(
+                os.path.abspath(src))
+            stem = os.path.splitext(os.path.basename(src))[0]
+            out_ext = (os.path.splitext(src)[1].lower()
+                       if is_watermark_image(src) else ".pdf")
+            target = os.path.join(out_dir, f"{stem}_watermarked{out_ext}")
+
+            self._wm_src_saved = src
+            self._wm_text_saved = self.wm_text.get()
+            self._wm_image_saved = settings["image"]
+            self._wm_color_saved = self.wm_color.get()
+            self._wm_opacity_saved = self.wm_opacity.get()
+            self._wm_rot_saved = self.wm_rot.get()
+            self._wm_size_saved = self.wm_size.get()
+            self._wm_pages_saved = settings["pages"]
+            self._wm_density_saved = str(settings["density"])
+            self._wm_out_saved = self.wm_out.get().strip()
+
+            self.wm_working = True
+            self.wm_button.state(["disabled"])
+            self.wm_progress.pack(fill="x", pady=(10, 0))
+            self.wm_progress.configure(value=0, maximum=100)
+            self.wm_status.set("Applying watermark…")
+
+            text = settings["text"]
+            image = settings["image"] if settings["type"] == "image" else ""
+            size = settings["size"]
+            color = settings["color"]
+            opacity = settings["opacity"]
+            angle = settings["angle"]
+            tiled = settings["tiled"]
+            pages = settings["pages"]
+            density = settings["density"]
+
+            def work():
+                try:
+                    stamped = apply_watermark(
+                        src, target, text=text, pages=pages, font_size=size,
+                        color=color, opacity=opacity, angle=angle, tiled=tiled,
+                        image=image, image_width=size, density=density,
+                        progress=lambda d, t, nm:
+                            self.wm_events.put(("progress", d, t, nm)))
+                    self.wm_events.put(("done", stamped, target, None))
+                except (WatermarkError, MergeError) as exc:
+                    self.wm_events.put(("done", 0, "", str(exc)))
+                except Exception as exc:
+                    self.wm_events.put(("done", 0, "", f"Unexpected problem: {exc}"))
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def _drain_wm_events(self):
+            try:
+                while True:
+                    event = self.wm_events.get_nowait()
+                    if event[0] == "progress":
+                        _, done, total, name = event
+                        self.wm_progress.configure(maximum=max(total, 1), value=done)
+                        self.wm_status.set(f"{name} · {done}/{total}")
+                    else:
+                        _, stamped, out, error = event
+                        self.wm_working = False
+                        self.wm_button.state(["!disabled"])
+                        if error:
+                            self.wm_progress.configure(value=0)
+                            self.wm_status.set("Watermark failed.")
+                            messagebox.showerror("Watermark failed", error)
+                        else:
+                            self.wm_progress.configure(
+                                value=self.wm_progress["maximum"])
+                            if is_watermark_image(out):
+                                what = "image"
+                            else:
+                                what = (f"{stamped} page"
+                                        f"{'s' if stamped != 1 else ''}")
+                            self.wm_status.set(
+                                f"Watermarked {what} -> {os.path.basename(out)}")
+                            if messagebox.askyesno(
+                                    "Done", f"Watermarked {what} to:\n"
+                                    f"{out}\n\nOpen the folder?"):
+                                open_folder(out)
+            except queue.Empty:
+                pass
+            self._wm_drain_id = self.after(100, self._drain_wm_events)
+
         # -- teardown --------------------------------------------------
         def destroy(self):
-            for attr in ("_drain_id", "_conv_drain_id", "_ex_drain_id"):
+            for attr in ("_drain_id", "_conv_drain_id", "_ex_drain_id",
+                         "_wm_drain_id", "_wm_preview_after"):
                 ident = getattr(self, attr, None)
                 if ident is not None:
                     try:
@@ -2715,6 +3564,8 @@ def main() -> int:
         return run_convert_cli(argv[1:])
     if argv and argv[0] == "extract":
         return run_extract_cli(argv[1:])
+    if argv and argv[0] == "watermark":
+        return run_watermark_cli(argv[1:])
     if argv and argv[0] == "merge":
         return run_cli(argv[1:])
     if argv and argv[0] == "--cli":
