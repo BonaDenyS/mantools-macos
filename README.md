@@ -3,6 +3,14 @@
 Installs Mantools for the current user (no `sudo`) as
 `~/Applications/Mantools.app`.
 
+## Preview
+
+![Mantools on macOS](preview.png)
+
+*Mantools on macOS. The interface is identical on every platform — light and
+dark themes, and the Merge / Convert / Extract tabs; only the window chrome
+differs per OS.*
+
 ## Install
 In Terminal (recommended, since downloaded scripts aren’t executable yet):
 
