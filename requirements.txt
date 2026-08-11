@@ -1,0 +1,19 @@
+# Local PDF Toolkit - dependencies
+#
+# Install everything:   pip install -r requirements.txt
+# The app degrades gracefully: with only pypdf you can still merge and use the
+# outline preview. Each extra package below unlocks more of the toolkit.
+
+# --- required ---
+pypdf>=5.0            # merge engine (page ranges, rotation, bookmarks)
+
+# --- previews + PDF -> Office ---
+pymupdf>=1.24         # visual page thumbnails in Preview; renders PDF -> PPTX
+pdf2docx>=0.5.8       # high-fidelity PDF -> Word (falls back to text-only w/o it)
+python-pptx>=1.0      # PDF -> PowerPoint (one slide image per page)
+openpyxl>=3.1         # PDF -> Excel (table extraction, text fallback)
+
+# --- Office -> PDF (Windows only) ---
+# Also needs Microsoft Word / PowerPoint / Excel installed locally; the app
+# drives them through COM. No Office => these conversions are disabled in the UI.
+comtypes>=1.2 ; sys_platform == "win32"

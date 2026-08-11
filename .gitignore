@@ -1,0 +1,37 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Local virtual environment (install.command creates one) ---
+venv/
+.venv/
+env/
+ENV/
+
+# --- Build / packaging artifacts ---
+build/
+dist/
+*.spec
+
+# --- Built app bundle (install.command builds to ~/Applications) ---
+Mantools.app/
+*.app/
+
+# --- macOS Finder / editor cruft ---
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.VolumeIcon.icns
+*.swp
+.idea/
+.vscode/
